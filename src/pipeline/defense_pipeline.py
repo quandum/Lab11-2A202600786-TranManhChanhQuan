@@ -40,6 +40,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 
+# Seconds to wait AFTER every real API (Gemini) call to stay under the provider
+# rate limit. This cooldown is tracked separately (see ``slept_seconds``) and is
+# excluded from the measured request latency. The mock backend never sleeps.
+API_COOLDOWN_SECONDS = 60
+
+
 # ============================================================================
 # LLM backend (Gemini if available, deterministic mock otherwise)
 # ============================================================================
@@ -68,6 +74,8 @@ class BankingLLM:
         self.model = model
         self._client = None
         self.backend = "mock"
+        self.cooldown = API_COOLDOWN_SECONDS  # seconds to wait after each API call
+        self.slept_seconds = 0.0              # cumulative cooldown (excluded from latency)
         try:
             import os
             from google import genai  # type: ignore
@@ -80,6 +88,13 @@ class BankingLLM:
             self._client = None
             self.backend = "mock"
 
+    def _cooldown(self) -> None:
+        """Sleep after a real API call and record the time (so it can be
+        excluded from latency). Avoids exceeding the provider rate limit."""
+        if self.cooldown > 0:
+            time.sleep(self.cooldown)
+            self.slept_seconds += self.cooldown
+
     def generate(self, user_input: str) -> str:
         """Return a candidate answer for the user input."""
         if self.backend == "gemini" and self._client is not None:
@@ -91,6 +106,8 @@ class BankingLLM:
                 return (resp.text or "").strip()
             except Exception as exc:  # network/quota -> graceful fallback
                 return f"(LLM error, mock fallback) {self._mock(user_input)} [{exc}]"
+            finally:
+                self._cooldown()  # always wait after hitting the API
         return self._mock(user_input)
 
     def _mock(self, user_input: str) -> str:
@@ -372,6 +389,14 @@ class LlmJudge:
         self._model = llm.model
         self.backend = "gemini" if self._client else "heuristic"
         self.fail_count = 0
+        self.cooldown = API_COOLDOWN_SECONDS  # seconds to wait after each API call
+        self.slept_seconds = 0.0              # cumulative cooldown (excluded from latency)
+
+    def _cooldown(self) -> None:
+        """Sleep after a real API call and record the time (excluded from latency)."""
+        if self.cooldown > 0:
+            time.sleep(self.cooldown)
+            self.slept_seconds += self.cooldown
 
     def evaluate(self, response_text: str) -> JudgeScores:
         scores = self._evaluate_gemini(response_text) if self._client else self._evaluate_heuristic(response_text)
@@ -388,6 +413,8 @@ class LlmJudge:
             return self._parse(out.text or "")
         except Exception:
             return self._evaluate_heuristic(response_text)
+        finally:
+            self._cooldown()  # always wait after hitting the API
 
     def _parse(self, raw: str) -> JudgeScores:
         def grab(key: str, default: int = 5) -> int:
@@ -606,9 +633,14 @@ class DefensePipeline:
         """Run one request through every layer and return the result."""
         start = time.perf_counter()
         judge_dict: Optional[dict] = None
+        # Reset API cooldown accumulators so this request's latency excludes the
+        # 60s waits added after each Gemini call.
+        self.llm.slept_seconds = 0.0
+        self.judge.slept_seconds = 0.0
 
         def finish(resp: str, blocked: bool, by=None, pat=None, redacted=False) -> PipelineResponse:
-            latency = (time.perf_counter() - start) * 1000
+            throttle = self.llm.slept_seconds + self.judge.slept_seconds
+            latency = (time.perf_counter() - start - throttle) * 1000
             self.audit.log({
                 "user_id": user_id,
                 "input": user_input,
