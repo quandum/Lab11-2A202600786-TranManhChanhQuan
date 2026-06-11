@@ -9,6 +9,30 @@ The pipeline chains six independent layers: **(1) Rate Limiter → (2) Input Gua
 
 ---
 
+## Run summary (from the executed notebook)
+
+- **Backends:** LLM = `gemini`, Judge = `gemini` (real Gemini API, not the mock).
+- **Test 1 — Safe queries:** **5 / 5 PASSED**, every response scored **5/5** on all four judge criteria (safety, relevance, accuracy, tone). Two of the five briefly hit a transient Gemini error and fell back to the deterministic mock answer, but both still passed the judge.
+- **Test 2 — Attacks:** **7 / 7 BLOCKED** at the **Input Guardrail** (no LLM call). Matched patterns: `ignore_instructions`, `role_override`, `reveal_secret`, `system_prompt_probe`, `vn_ignore`, `credentials_request`, `creative_bypass`.
+- **Test 3 — Rate limiting:** first **10** requests passed; requests **11–15 BLOCKED** by the rate limiter (*"Too many requests. Please wait 55.5s…"*).
+- **Test 4 — Edge cases:** **5 / 5 BLOCKED** — `empty_input`, `too_long`, `off_topic` (emoji), `sql_injection`, `off_topic`.
+- **Output guardrail redaction:** all secrets scrubbed — found `api_key(1)`, `admin_pw(1)`, `db_conn(1)`, `email(1)`, `vn_phone(1)`.
+- **Monitoring & audit (32 requests total):**
+
+| Metric | Value |
+|--------|-------|
+| total_requests | 32 |
+| blocked | 17 |
+| block_rate | 53.1% |
+| rate_limit_hits | 5 |
+| judge_fails | 0 |
+| judge_fail_rate | 0.0% |
+| avg_latency_ms | 354.03 |
+
+**Alert fired:** `RATE-LIMIT ABUSE: 5 hits`. Audit log exported to `security_audit.json` (32 records). The 53% block rate is dominated by the deliberately adversarial Test‑2/Test‑4 suites and the rate‑limit stress test, so it stays just under the 60% alert threshold while the rate‑limit‑abuse alert correctly fires.
+
+---
+
 ## Q1. Layer analysis — which layer caught each Test‑2 attack first
 
 | # | Attack prompt | Caught **first** by | Matched pattern | Other layers that would also catch it |
@@ -50,7 +74,7 @@ To find where false positives appear, I tightened the input layer in two ways:
 
 ## Q4. Production readiness for a real bank (10,000 users)
 
-- **Latency / LLM calls:** today a *passing* request costs **2 LLM calls** (banking answer + judge). At scale I would (a) **gate the judge** so it runs only on flagged/low‑confidence or high‑risk responses, (b) **cache** judge verdicts for repeated answers, and (c) run a cheap regex/classifier first so most traffic never reaches the judge.
+- **Latency / LLM calls:** today a *passing* request costs **2 Gemini calls** (banking answer + judge); the notebook run measured an **average end‑to‑end latency of ~354 ms** (excluding the API rate‑limit cooldown). At scale I would (a) **gate the judge** so it runs only on flagged/low‑confidence or high‑risk responses, (b) **cache** judge verdicts for repeated answers, and (c) run a cheap regex/classifier first so most traffic never reaches the judge.
 - **Cost:** add a **token/cost guard** per user and per tenant; the judge is the dominant cost, so sampling it (e.g. 10–20% of safe traffic + 100% of risky traffic) cuts cost dramatically while keeping coverage.
 - **Monitoring at scale:** the in‑memory `AuditLog`/`Monitor` must move to a streaming sink (e.g. Kafka → BigQuery/Elastic) with dashboards and **paged alerts** on block‑rate, judge‑fail‑rate and rate‑limit spikes; rate‑limit state moves to **Redis** so it works across many stateless app instances.
 - **Updating rules without redeploying:** externalise injection patterns, topic lists and thresholds into a **versioned config / feature‑flag service** with canary rollout and instant rollback, so security can ship a new rule in minutes without a code deploy.
