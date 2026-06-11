@@ -1,5 +1,7 @@
 # Assignment 11 — Defense-in-Depth Pipeline: Individual Report
 
+**Student:** Trần Mạnh Chánh Quân
+**Student ID:** 2A202600786
 **Course:** AICB-P1 — AI Agent Development
 **Deliverable:** Part B (40 pts) — companion to `notebooks/assignment11_defense_pipeline.ipynb`
 
